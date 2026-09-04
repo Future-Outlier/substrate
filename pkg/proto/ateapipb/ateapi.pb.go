@@ -3309,6 +3309,7 @@ type SystemInfoVolumeSource struct {
 	// +k8s:optional
 	// +k8s:maxItems=8
 	// +k8s:listType=atomic
+	// +k8s:customValidation # paths unique across entries
 	DataSources   []*SystemInfoDataSource `protobuf:"bytes,1,rep,name=data_sources,json=dataSources,proto3" json:"data_sources,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3472,9 +3473,13 @@ type ActorMetadataItem struct {
 	// +k8s:minimum=1
 	// +k8s:maximum=3 # keep this in sync with the ActorMetadataField enum
 	Field ActorMetadataField `protobuf:"varint,1,opt,name=field,proto3,enum=ateapi.ActorMetadataField" json:"field,omitempty"`
+	// path must be a clean relative Unix path: at most 16 '/'-separated
+	// segments, none of them empty, '.' or '..', and no NUL byte.
+	//
 	// +k8s:required
 	// +k8s:minLength=1
 	// +k8s:maxLength=255
+	// +k8s:customValidation # projected-path rule shared with atelet, see internal/volumepath
 	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3532,9 +3537,13 @@ type TrustBundleDataSource struct {
 	// +k8s:minLength=1
 	// +k8s:maxLength=253
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// path must be a clean relative Unix path: at most 16 '/'-separated
+	// segments, none of them empty, '.' or '..', and no NUL byte.
+	//
 	// +k8s:required
 	// +k8s:minLength=1
 	// +k8s:maxLength=255
+	// +k8s:customValidation # projected-path rule shared with atelet, see internal/volumepath
 	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
