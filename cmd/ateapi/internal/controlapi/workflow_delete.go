@@ -21,6 +21,7 @@ import (
 	"log/slog"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
+	"github.com/agent-substrate/substrate/internal/objectstore"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -84,6 +85,10 @@ func (w *ActorWorkflow) DeleteActor(ctx context.Context, actorRef resources.Acto
 
 	if err := w.ensureVolumesDeleted(ctx, actor); err != nil {
 		errs = append(errs, fmt.Errorf("while deleting volumes: %w", err))
+	}
+
+	if err := w.ensureExternalSnapshotsReleased(ctx, actor, actorTemplate); err != nil {
+		errs = append(errs, fmt.Errorf("while releasing external snapshots: %w", err))
 	}
 
 	if len(errs) > 0 {
@@ -359,6 +364,70 @@ func (w *ActorWorkflow) ensureVolumesDeleted(ctx context.Context, actor *ateapip
 		return status.Errorf(codes.Internal, "while deleting actor volumes: %v", err)
 	}
 	return nil
+}
+
+// ensureExternalSnapshotsReleased collects everything the actor wrote to
+// object storage, by deleting its own prefix. It runs before the actor is
+// removed, so a failed attempt is still rediscoverable on the retry.
+//
+// A snapshot borrowed from a tag lives under the tag's prefix, so it survives:
+// the tag owns it and outlives the actor.
+func (w *ActorWorkflow) ensureExternalSnapshotsReleased(ctx context.Context, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (err error) {
+	ctx, done := stepSpan(ctx, "ReleaseExternalSnapshots")
+	defer func() { err = done(err) }()
+
+	if w.objectStore == nil {
+		markSkipped(ctx, "no object store configured")
+		return nil
+	}
+
+	prefix, err := actorSnapshotStoragePrefix(ctx, actor, actorTemplate)
+	if err != nil {
+		return err
+	}
+	if prefix.IsZero() {
+		markSkipped(ctx, "the actor owns no external snapshot")
+		return nil
+	}
+	return objectstore.DeletePrefix(ctx, w.objectStore, prefix)
+}
+
+// actorSnapshotStoragePrefix returns the prefix holding every object the actor wrote:
+// the snapshot it last took, the one a suspend was in the middle of taking, and
+// anything a crashed suspend stranded. A zero prefix means the actor never
+// wrote anything.
+func actorSnapshotStoragePrefix(ctx context.Context, actor *ateapipb.Actor, actorTemplate *ateapipb.ActorTemplate) (resources.StoragePrefix, error) {
+	owner := actorSnapshotOwner(actor)
+	if snapshotURI := actor.GetStatus().GetExternalSnapshot().GetSnapshotUri(); snapshotURI != "" {
+		uri, err := resources.ParseSnapshotURI(snapshotURI)
+		if err != nil {
+			return resources.StoragePrefix{}, fmt.Errorf("while parsing the external snapshot %q: %w", snapshotURI, err)
+		}
+		// The recorded URI names the actor's prefix, so no template lookup is
+		// needed. A URI the actor does not own is a tag's, borrowed until the
+		// actor's first suspend completes, which means it has written nothing of
+		// its own yet.
+		if uri.OwnedBy(owner) {
+			return uri.OwnerPrefix(), nil
+		}
+	}
+	// Nothing of the actor's own is recorded. Unless a suspend died partway,
+	// nothing was ever written under its prefix: the in-progress name is
+	// recorded before atelet uploads the first object.
+	name := actor.GetStatus().GetInProgressSnapshotName()
+	if name == "" {
+		return resources.StoragePrefix{}, nil
+	}
+	// The template's storage location is the only place the actor's prefix can
+	// be derived from now. Without it the actor would be stuck DELETING forever.
+	// TODO: prevent this from leaking objects in the external storage.
+	if actorTemplate == nil {
+		slog.WarnContext(ctx, "Leaking an in-progress external snapshot, the actor's template no longer resolves",
+			slog.String("actor", actor.GetMetadata().GetName()),
+			slog.String("in_progress_snapshot_name", name))
+		return resources.StoragePrefix{}, nil
+	}
+	return owner.Prefix(actorTemplate.GetSnapshotsConfig().GetStorageLocation())
 }
 
 // finalizeDeleted removes the actor from the store and returns the deleted

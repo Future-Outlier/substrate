@@ -323,15 +323,20 @@ snapshotsConfig:
 
 ### Snapshot Storage Layout
 
-`snapshotsConfig.storageLocation` is a **base prefix**, not the address of any one snapshot. Every snapshot taken from the template lands at:
+`snapshotsConfig.storageLocation` is a **base prefix**, not the address of any one snapshot. Every external snapshot has exactly one owner: the actor that took it, or the tag that copied it. And the owner is part of the path, so an object's name says who it belongs to:
 
 ```
-<location>/snapshots/<atespace>/<snapshot name>
+<location>/atespaces/<atespace>/actors/<actor uid>/snapshots/<snapshot name>
+<location>/atespaces/<atespace>/actor-snapshot-tags/<snapshot name>
 ```
 
-and the objects of that snapshot (its manifest, memory image, durable-data tar) are named below it. So for the template above, a snapshot named `f47ac10b-…` of an actor in atespace `team-a` is stored at `gs://my-bucket/secret-agent/snapshots/team-a/f47ac10b-…`, and the template's golden snapshot — the golden actor lives in the reserved `ate-golden` atespace — at `gs://my-bucket/secret-agent/snapshots/ate-golden/<name>`.
+The objects of a snapshot (its manifest, memory image, durable-data tar) are named below it. So for the template above, a snapshot of an actor in atespace `team-a` is stored at `gs://my-bucket/secret-agent/atespaces/team-a/actors/3f8b…/snapshots/f47ac10b-…`, and the template's golden snapshot — the golden actor lives in the reserved `ate-golden` atespace — under `gs://my-bucket/secret-agent/atespaces/ate-golden/actors/<uid>/snapshots/<name>`.
 
-Each `ActorSnapshot` reports its own address in the server-managed `status.snapshotUri` field. It is recorded when the snapshot is written, not recomputed on read, so the layout can change in future versions without stranding existing snapshots. Do not send it on input; parse it only against the scheme above.
+An actor takes a series of snapshots over its life, so it gets a prefix of its own and each snapshot sits below it. A tag holds exactly one, so the tag's prefix *is* its snapshot's. The actor level is keyed on the UID rather than the name, so an actor recreated under a name that was used before never inherits its predecessor's objects.
+
+An owner is collected by deleting everything under its prefix, and it can delete nothing else. That is what makes a borrowed snapshot safe: an actor created from a tag points at a URI under `actor-snapshot-tags/`, which its own prefix does not cover. See [Snapshot lifetime](#snapshot-lifetime).
+
+An `Actor` reports its current snapshot in the server-managed `status.externalSnapshot`, an `ActorSnapshotTag` in `status.snapshot`, and an `ActorTemplate` its golden one in `status.goldenSnapshotStatus.goldenSnapshot` — each an `ExternalSnapshot` carrying `snapshotUri` and the `contentScope` it captured. The URI is recorded when the snapshot is written, not recomputed on read, so the layout can change in future versions without stranding existing snapshots. All three are server-owned: do not send them on input, and parse a URI only against the scheme above.
 
 An `ActorTemplate` belongs to one atespace, but one `storageLocation` still holds snapshots for many atespaces: the golden actor lives in the reserved `ate-golden` atespace, and a `PUBLISHED` snapshot may be cloned from other atespaces. The `<atespace>` level exists so that access can be granted per tenant: an object-storage policy can only condition on an **object-name prefix**, and cannot read the identity recorded inside a snapshot's manifest. Binding a per-atespace grant on GCS looks like:
 
@@ -343,13 +348,10 @@ An `ActorTemplate` belongs to one atespace, but one `storageLocation` still hold
     title: team-a-snapshots
     expression: >
       resource.name.startsWith(
-        "projects/_/buckets/my-bucket/objects/secret-agent/snapshots/team-a/")
+        "projects/_/buckets/my-bucket/objects/secret-agent/atespaces/team-a/")
 ```
 
-Two consequences worth planning for:
-
-- **A published snapshot is read from the atespace that took it.** Cloning across atespaces via a `PUBLISHED` tag reads the source atespace's prefix, so the reader needs a grant covering it — the target atespace's grant is not enough.
-- **A location containing its own `snapshots` segment is legal but confusing.** `gs://my-bucket/snapshots/secret-agent` yields `gs://my-bucket/snapshots/secret-agent/snapshots/<atespace>/<name>`. It parses correctly; it just reads badly in a policy.
+One consequence worth planning for: **a published snapshot is read from the atespace that took it.** Cloning across atespaces via a `PUBLISHED` tag reads the source atespace's prefix, so the reader needs a grant covering it — the target atespace's grant is not enough.
 
 ---
 
@@ -429,6 +431,7 @@ The Substrate Control Plane (`ate-api-server`) exposes a gRPC interface for mana
 Registers a new logical actor in the system.
 *   **Request:** `CreateActorRequest`
     *   `actor`: `Actor` — the actor to create. Its `metadata` carries the atespace and name (name must be a DNS-1123 label); the `actor_template` ref (atespace + name) selects the `ActorTemplate`.
+    *   `actor.source_snapshot_tag`: (Optional) `ObjectRef` of an `ActorSnapshotTag` to seed the actor from. The tag must be taken under the same `ActorTemplate`, and either in the actor's own atespace or `PUBLISHED`. Nothing is copied: the new actor's `status.externalSnapshot` points at the tag's snapshot, under the tag's prefix, until its own first suspend.
 *   **Response:** the initialized `Actor`.
 
 #### `UpdateActor`
@@ -451,7 +454,23 @@ Activates a suspended actor by restoring it onto a physical worker.
 Hibernate a running actor, capturing its current RAM and disk state into a snapshot.
 *   **Request:** `SuspendActorRequest`
     *   `actor`: `ObjectRef` of the actor to suspend.
-*   **Response:** `SuspendActorResponse` containing the `Actor` object in `ACTOR_STATE_SUSPENDED`.
+*   **Response:** `SuspendActorResponse` containing the `Actor` object in `ACTOR_STATE_SUSPENDED`, with its snapshot in `status.externalSnapshot`.
+*   A successful suspend releases the actor's previous external snapshot: an actor keeps one, and only tags outlive it. To keep the snapshot a suspend just wrote, tag it with `CreateActorSnapshotTag` while the actor is still suspended.
+
+#### Snapshot lifetime
+
+Every external snapshot has exactly one owner, and the control plane deletes it when that owner lets go:
+
+| Owner | Released when |
+| :--- | :--- |
+| The actor that took it (`status.externalSnapshot`) | The actor's next successful suspend replaces it, or the actor is deleted. |
+| The tag that copied it (`status.snapshot`) | The tag is deleted. |
+
+An actor created from a tag borrows the tag's copy instead of taking one of its own. The borrowed URI sits under the tag's prefix, which the actor's own prefix does not cover, so neither suspending nor deleting the actor can reach it; its first own suspend writes a snapshot under the actor's prefix, and it owns its snapshots from then on.
+
+Deletion always runs before the database reference is dropped, and a failure fails the whole RPC. Clients are expected to retry with the same arguments: destinations are deterministic and every phase tolerates a partly-completed predecessor, so a retry resumes rather than duplicating work. The cost of that ordering is that a crash between the two can leave an external snapshot no row names; the reverse order would instead lose the handle needed to ever delete it.
+
+> **Do not delete a tag while actors created from it exist.** A clone borrows the tag's snapshot rather than copying it, and only stops borrowing at its own first suspend (its `status.externalSnapshot.snapshotUri` still names the tag's prefix while it is). Deleting the tag leaves such a clone unable to resume. This is not prevented today.
 
 #### `DeleteActor`
 Removes an actor from the registry and cleans up associated resources.
@@ -459,6 +478,7 @@ Removes an actor from the registry and cleans up associated resources.
     *   `actor`: `ObjectRef` of the actor to delete. Delete takes no preconditions today, so it is last-writer-wins.
     *   `any_state`: (Optional) If `true`, allows deleting the actor from any state (e.g. `RUNNING`, `PAUSED`), terminating active workloads, detaching volumes, and releasing worker allocations. By default (`false`), only actors in `ACTOR_STATE_SUSPENDED` or `ACTOR_STATE_CRASHED` (or already `ACTOR_STATE_DELETING`) can be deleted.
 *   **Response:** the deleted `Actor`, as it was immediately before removal.
+*   Deleting an actor also deletes the external snapshot it owns, along with one an interrupted suspend left behind. Snapshots it only borrows from a tag are left alone, and its tags are unaffected — they hold their own copies.
 
 #### `GetActor` / `ListActors`
 Query the state of logical actors.
